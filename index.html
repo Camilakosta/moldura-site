@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>Moldura - Foto e Vídeo com Áudio</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;width:100%;background:#000;font-family:Arial,Helvetica,sans-serif;overflow:hidden}
+  video#hiddenVideo{display:none}
+  canvas#stage{
+    position:absolute;top:0;left:0;width:100vw;height:100vh;background:#000;
+  }
+  img#overlayImg{display:none}
+  #controls{position:absolute;bottom:28px;left:0;right:0;display:flex;justify-content:center;gap:18px;z-index:50;}
+  .btn{width:70px;height:70px;border-radius:50%;border:none;background:#fff;font-size:26px;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(0,0,0,0.35);cursor:pointer}
+  #recBtn.recording{background:#d32f2f;color:#fff}
+  #previewModal{position:absolute;inset:0;background:rgba(0,0,0,0.9);display:none;align-items:center;justify-content:center;flex-direction:column;z-index:60;padding:18px}
+  #previewImg{max-width:92vw;border:3px solid #fff;border-radius:8px}
+  .action{margin-top:12px;padding:10px 18px;border-radius:8px;border:none;color:#fff;font-size:15px;cursor:pointer;width:220px}
+  .save{background:#28a745}
+  .retake{background:#ff5252}
+  .saveVideo{background:#1e88e5}
+  #notes{color:#fff;margin-top:12px;text-align:center;max-width:90%;font-size:14px}
+  #topNote{position:absolute;top:14px;left:14px;color:#fff;z-index:70;background:rgba(0,0,0,0.4);padding:8px 10px;border-radius:8px;font-size:13px}
+</style>
+</head>
+<body>
+
+<video id="hiddenVideo" autoplay playsinline muted></video>
+<canvas id="stage"></canvas>
+<img id="overlayImg" src="moldura.png" alt="moldura">
+
+<div id="topNote">Toque em 📸 para foto • 🎬 para gravar (áudio do microfone) • 🔄 trocar câmera</div>
+
+<div id="controls">
+  <button id="switchBtn" class="btn" title="Trocar câmera">🔄</button>
+  <button id="captureBtn" class="btn" title="Foto">📸</button>
+  <button id="recBtn" class="btn" title="Gravar">🎬</button>
+</div>
+
+<div id="previewModal">
+  <img id="previewImg" alt="preview">
+  <button id="savePhotoBtn" class="action save">Salvar Foto</button>
+  <button id="saveVideoBtn" class="action saveVideo" style="display:none">Salvar Vídeo</button>
+  <button id="retakeBtn" class="action retake">Fechar / Tirar outra</button>
+  <div id="notes" style="display:none">iPhone: se o download não iniciar, toque e segure a imagem e selecione "Salvar".</div>
+</div>
+
+<script>
+(async function(){
+  const hiddenVideo = document.getElementById('hiddenVideo');
+  const canvas = document.getElementById('stage');
+  const ctx = canvas.getContext('2d');
+  const overlayImg = document.getElementById('overlayImg');
+
+  const switchBtn = document.getElementById('switchBtn');
+  const captureBtn = document.getElementById('captureBtn');
+  const recBtn = document.getElementById('recBtn');
+
+  const previewModal = document.getElementById('previewModal');
+  const previewImg = document.getElementById('previewImg');
+  const savePhotoBtn = document.getElementById('savePhotoBtn');
+  const saveVideoBtn = document.getElementById('saveVideoBtn');
+  const retakeBtn = document.getElementById('retakeBtn');
+  const notes = document.getElementById('notes');
+
+  let useFront = true;
+  let cameraStream = null;
+  let rafId = null;
+  let recording = false;
+  let mediaRecorder = null;
+  let recordedBlobs = [];
+  let canvasStream = null;
+  let micStream = null; // microfone
+
+  const constraintsBase = {
+    video: { width:{ ideal:1280 }, height:{ ideal:720 }, frameRate:{ ideal:30, min:24 }, facingMode:'user' },
+    audio: false
+  };
+
+  async function startCamera(){
+    if(cameraStream) cameraStream.getTracks().forEach(t=>t.stop());
+    const constraints = JSON.parse(JSON.stringify(constraintsBase));
+    constraints.video.facingMode = useFront ? 'user' : 'environment';
+    try{
+      cameraStream = await navigator.mediaDevices.getUserMedia(constraints);
+      hiddenVideo.srcObject = cameraStream;
+      await hiddenVideo.play();
+
+      const track = cameraStream.getVideoTracks()[0];
+      const settings = track.getSettings();
+      const naturalWidth = settings.width || hiddenVideo.videoWidth || 1280;
+      const naturalHeight = settings.height || hiddenVideo.videoHeight || 720;
+
+      canvas.width = naturalWidth;
+      canvas.height = naturalHeight;
+
+      startLoop();
+    }catch(err){
+      alert('Erro ao acessar câmera: ' + (err && err.message ? err.message : err));
+    }
+  }
+
+  function clearLoop(){ if(rafId) cancelAnimationFrame(rafId); rafId = null; }
+
+  function startLoop(){
+    clearLoop();
+    function draw(){
+      const cw = canvas.width, ch = canvas.height;
+      const vw = hiddenVideo.videoWidth || cw, vh = hiddenVideo.videoHeight || ch;
+
+      const scale = Math.max(cw / vw, ch / vh);
+      const sw = vw * scale, sh = vh * scale;
+      const sx = (cw - sw) / 2;
+      const sy = (ch - sh) / 2;
+
+      ctx.clearRect(0,0,cw,ch);
+
+      if(useFront){
+        ctx.save();
+        ctx.translate(cw,0);
+        ctx.scale(-1,1);
+        ctx.drawImage(hiddenVideo, sx, sy, sw, sh);
+        ctx.restore();
+      } else {
+        ctx.drawImage(hiddenVideo, sx, sy, sw, sh);
+      }
+
+      if(overlayImg.complete && overlayImg.naturalWidth){
+        const ow = overlayImg.naturalWidth, oh = overlayImg.naturalHeight;
+        const ratio = Math.min(cw/ow, ch/oh);
+        const dw = ow * ratio, dh = oh * ratio;
+        const dx = (cw - dw)/2, dy = (ch - dh)/2;
+        ctx.drawImage(overlayImg, dx, dy, dw, dh);
+      }
+
+      rafId = requestAnimationFrame(draw);
+    }
+    rafId = requestAnimationFrame(draw);
+  }
+
+  captureBtn.addEventListener('click', ()=> {
+    // snapshot: directly use canvas content
+    const dataUrl = canvas.toDataURL('image/png');
+    previewImg.src = dataUrl;
+    previewModal.style.display = 'flex';
+    saveVideoBtn.style.display = 'none';
+    notes.style.display = /iPhone|iPad|iPod/i.test(navigator.userAgent) ? 'block' : 'none';
+  });
+
+  recBtn.addEventListener('click', async () => {
+    if(recording){
+      stopRecording();
+    } else {
+      await startRecordingWithAudio();
+    }
+  });
+
+  async function startRecordingWithAudio(){
+    // request microphone only when user starts recording
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    } catch(e) {
+      // user denied mic — proceed without audio if denied
+      micStream = null;
+      console.warn('Microfone não disponível ou permissão negada. Gravando sem áudio.');
+    }
+
+    // capture canvas video stream
+    canvasStream = canvas.captureStream(30);
+
+    // combine canvas video track(s) + mic audio track(s)
+    const combined = new MediaStream();
+    canvasStream.getVideoTracks().forEach(t => combined.addTrack(t));
+    if(micStream){
+      micStream.getAudioTracks().forEach(t => combined.addTrack(t));
+    }
+
+    recordedBlobs = [];
+    let options = { mimeType: 'video/webm;codecs=vp9,opus' };
+    if(!MediaRecorder.isTypeSupported(options.mimeType)){
+      options = { mimeType: 'video/webm;codecs=vp8,opus' };
+      if(!MediaRecorder.isTypeSupported(options.mimeType)){
+        options = { mimeType: 'video/webm' };
+      }
+    }
+
+    try {
+      mediaRecorder = new MediaRecorder(combined, options);
+    } catch(e) {
+      console.error('MediaRecorder erro:', e);
+      mediaRecorder = new MediaRecorder(combined);
+    }
+
+    mediaRecorder.ondataavailable = (e) => { if(e.data && e.data.size) recordedBlobs.push(e.data); };
+    mediaRecorder.onstop = () => {
+      recording = false;
+      recBtn.classList.remove('recording');
+      recBtn.textContent = '🎬';
+      const superBuffer = new Blob(recordedBlobs, { type: recordedBlobs[0]?.type || 'video/webm' });
+      const url = window.URL.createObjectURL(superBuffer);
+      previewImg.src = canvas.toDataURL('image/png');
+      previewModal.style.display = 'flex';
+      saveVideoBtn.style.display = 'inline-block';
+      notes.style.display = /iPhone|iPad|iPod/i.test(navigator.userAgent) ? 'block' : 'none';
+
+      saveVideoBtn.onclick = () => {
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = url;
+        a.download = 'video-moldura.webm';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        // on some iOS browsers the blob download won't start — user must save manually
+      };
+
+      // stop mic stream tracks if present
+      if(micStream){
+        micStream.getTracks().forEach(t => t.stop());
+        micStream = null;
+      }
+      if(canvasStream){
+        canvasStream.getTracks().forEach(t => t.stop());
+        canvasStream = null;
+      }
+    };
+
+    mediaRecorder.start(100);
+    recording = true;
+    recBtn.classList.add('recording');
+    recBtn.textContent = '⏹';
+  }
+
+  function stopRecording(){
+    if(mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+  }
+
+  savePhotoBtn.addEventListener('click', () => {
+    const link = document.createElement('a');
+    link.href = previewImg.src;
+    link.download = 'foto-moldura.png';
+    link.click();
+    notes.style.display = /iPhone|iPad|iPod/i.test(navigator.userAgent) ? 'block' : 'none';
+  });
+
+  retakeBtn.addEventListener('click', ()=>{
+    previewModal.style.display = 'none';
+    notes.style.display = 'none';
+  });
+
+  switchBtn.addEventListener('click', async ()=>{
+    useFront = !useFront;
+    await startCamera();
+  });
+
+  await new Promise((resolve)=> {
+    if(overlayImg.complete && overlayImg.naturalWidth) return resolve();
+    overlayImg.onload = ()=> resolve();
+    overlayImg.onerror = ()=> { console.warn('Não foi possível carregar overlay (moldura). Verifique moldura.png'); resolve(); };
+  });
+
+  await startCamera();
+
+})();
+</script>
+</body>
+</html>
